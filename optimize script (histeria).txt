@@ -1,0 +1,116 @@
+cat << 'EOF' > optimize_server.sh
+#!/bin/bash
+
+# Ensure the script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ Please run as root (use sudo)"
+  exit
+fi
+
+# --- CONFIGURATION ---
+SWAP_SIZE_MB=2048
+# ---------------------
+
+echo "🚀 [1/6] Starting Server Optimization..."
+
+# 1. KILL VS CODE & NODE PROCESSES
+echo "🔪 [2/6] Killing VS Code & Node.js processes..."
+pkill -9 -f vscode-server
+pkill -9 -f "node.*vscode"
+pkill -9 -f "vscode-watcher"
+# Remove old server binaries
+rm -rf ~/.vscode-server/bin/* 2>/dev/null
+rm -rf ~/.vscode-server/data/logs/* 2>/dev/null
+rm -rf ~/.vscode-server/data/User/workspaceStorage/* 2>/dev/null
+# Clean for root user too just in case
+rm -rf /root/.vscode-server/bin/* 2>/dev/null
+echo "✅ Processes killed & cache cleaned."
+
+# 2. SETUP SWAP (2GB)
+echo "💾 [3/6] Setting up SWAP (${SWAP_SIZE_MB}MB)..."
+swapoff -a
+sed -i '/swap/d' /etc/fstab
+rm -f /swapfile
+
+dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE_MB status=none
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+sysctl -w vm.swappiness=10
+sysctl -w vm.vfs_cache_pressure=50
+
+if ! grep -q "vm.swappiness" /etc/sysctl.conf; then
+    echo 'vm.swappiness=10' >> /etc/sysctl.conf
+    echo 'vm.vfs_cache_pressure=50' >> /etc/sysctl.conf
+else
+    sed -i 's/vm.swappiness.*/vm.swappiness=10/' /etc/sysctl.conf
+    sed -i 's/vm.vfs_cache_pressure.*/vm.vfs_cache_pressure=50/' /etc/sysctl.conf
+fi
+echo "✅ Swap configured."
+
+# 3. LIMIT USER SLICE (VS Code) RAM
+echo "⚖️ [4/6] Setting User Slice RAM Limits..."
+mkdir -p /etc/systemd/system/user-.slice.d/
+cat <<LIMITS > /etc/systemd/system/user-.slice.d/50-limits.conf
+[Slice]
+MemoryHigh=600M
+MemoryMax=850M
+LIMITS
+echo "✅ User limits set."
+
+# 4. PROTECT HYSTERIA VPN
+echo "🛡️ [5/6] Protecting Hysteria VPN..."
+SERVICE_NAME=""
+if systemctl list-units --full -all | grep -q "hysteria-server.service"; then
+    SERVICE_NAME="hysteria-server.service"
+elif systemctl list-units --full -all | grep -q "hysteria.service"; then
+    SERVICE_NAME="hysteria.service"
+fi
+
+if [ ! -z "$SERVICE_NAME" ]; then
+    mkdir -p /etc/systemd/system/${SERVICE_NAME}.d/
+    cat <<PROTECT > /etc/systemd/system/${SERVICE_NAME}.d/override.conf
+[Service]
+OOMScoreAdjust=-1000
+MemorySwapMax=0
+PROTECT
+    echo "✅ Service $SERVICE_NAME protected."
+else
+    echo "⚠️ Hysteria service not found."
+fi
+
+# 5. FINAL TWEAKS
+echo "⚡ [6/6] Final Tweaks..."
+
+# Bashrc update for current user AND root
+if ! grep -q "NODE_OPTIONS" ~/.bashrc; then
+    echo 'export NODE_OPTIONS="--max-old-space-size=256"' >> ~/.bashrc
+fi
+if ! grep -q "NODE_OPTIONS" /root/.bashrc; then
+    echo 'export NODE_OPTIONS="--max-old-space-size=256"' >> /root/.bashrc
+fi
+
+systemctl stop fwupd 2>/dev/null
+systemctl disable fwupd 2>/dev/null
+systemctl mask fwupd 2>/dev/null
+
+if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+fi
+
+sysctl -p
+systemctl daemon-reload
+if [ ! -z "$SERVICE_NAME" ]; then
+    systemctl restart $SERVICE_NAME
+fi
+
+echo "🎉 DONE! Server optimized."
+echo "ℹ️  Run: free -h"
+EOF
+
+chmod +x optimize_server.sh
+sudo ./optimize_server.sh

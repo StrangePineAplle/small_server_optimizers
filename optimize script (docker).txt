@@ -1,0 +1,73 @@
+cat << 'EOF' > optimize_docker.sh
+#!/bin/bash
+
+# Ensure run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ Please run as root (use sudo)"
+  exit
+fi
+
+echo "🐳 [1/5] Starting Docker Priority Optimization..."
+
+# 1. SETUP SWAP (2GB) - Standard procedure
+echo "💾 [2/5] Checking SWAP..."
+# Only create if not exists or wrong size
+CURRENT_SWAP=$(free -m | awk '/Swap/ {print $2}')
+if [ "$CURRENT_SWAP" -lt 1900 ]; then
+    echo "   Creating 2GB Swap..."
+    swapoff -a
+    rm -f /swapfile
+    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+else
+    echo "   Swap is already OK ($CURRENT_SWAP MB)."
+fi
+
+# TUNE SWAPPINESS for Docker Env
+# We want system to use swap for idle processes, but keep Docker in RAM.
+# Swappiness 60 is default, but 30 is better here to prevent Docker from being swapped accidentally.
+sysctl -w vm.swappiness=30
+sysctl -w vm.vfs_cache_pressure=50
+echo "✅ Swap tuned."
+
+# 2. PROTECT DOCKER (The King)
+echo "🛡️ [3/5] Protecting Docker Service..."
+mkdir -p /etc/systemd/system/docker.service.d/
+cat <<PROTECT > /etc/systemd/system/docker.service.d/override.conf
+[Service]
+# Highest priority. OOM Killer will kill everything else first.
+OOMScoreAdjust=-1000
+# Docker containers should stay in RAM for speed.
+MemorySwapMax=0
+PROTECT
+echo "✅ Docker protected (OOM -1000)."
+
+# 3. LIMIT SSH USERS & SYSTEM
+echo "⚖️ [4/5] Limiting User Sessions..."
+mkdir -p /etc/systemd/system/user-.slice.d/
+cat <<LIMITS > /etc/systemd/system/user-.slice.d/50-limits.conf
+[Slice]
+# Force users (SSH, editors) to swap early to save RAM for Docker
+MemoryHigh=400M
+MemoryMax=600M
+LIMITS
+echo "✅ User limits set (Start swap at 400MB)."
+
+# 4. FINAL CLEANUP
+echo "⚡ [5/5] Restarting services..."
+systemctl daemon-reload
+
+# Apply Docker settings
+systemctl restart docker
+
+echo "🎉 DONE! Docker is now the priority."
+echo "ℹ️  Run: systemctl status docker | grep OOM"
+EOF
+
+chmod +x optimize_docker.sh
+sudo ./optimize_docker.sh
